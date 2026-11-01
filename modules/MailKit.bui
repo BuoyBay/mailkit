@@ -1,0 +1,639 @@
+Const MailCRLF As String = "\r\n"
+Const MailBoundary As String = "=_MailKit_mixed_1"
+
+Private Sub MailLimit(value As Integer)
+    If value < 1 Or value > 33554432 Then Throw New InvalidArgumentException("MailKit limit must be 1..33554432 bytes")
+End Sub
+
+Private Sub MailHeaderValue(value As String)
+    For Each ch As String In String.Chars(value)
+        Dim cp As Integer = String.Asc(ch)
+        If cp < 32 Or cp = 127 Then Throw New InvalidArgumentException("MailKit header contains a control character")
+    Next
+End Sub
+
+Private Sub MailMailbox(value As String)
+    MailHeaderValue(value)
+    If String.Len(value) < 3 Or String.Len(value) > 254 Then Throw New InvalidArgumentException("MailKit requires a bare ASCII mailbox")
+    Dim parts As Array Of String = String.Split(value, "@", True)
+    If Array.Count(parts) <> 2 Then Throw New InvalidArgumentException("MailKit requires one mailbox @")
+    If String.Len(parts(0)) < 1 Or String.Len(parts(0)) > 64 Or String.Len(parts(1)) < 1 Then Throw New InvalidArgumentException("MailKit mailbox component is empty or too long")
+    For Each ch As String In String.Chars(value)
+        If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+-/=?^_`{|}~@", ch, True) Then Throw New InvalidArgumentException("MailKit mailbox must use ASCII atom characters")
+    Next
+    If String.Left(parts(0), 1) = "." Or String.Right(parts(0), 1) = "." Or String.Contains(parts(0), "..", True) Then Throw New InvalidArgumentException("MailKit invalid dot-atom mailbox")
+    For Each label As String In String.Split(parts(1), ".", True)
+        If String.Len(label) < 1 Or String.Len(label) > 63 Then Throw New InvalidArgumentException("MailKit invalid domain label")
+        If String.Left(label, 1) = "-" Or String.Right(label, 1) = "-" Then Throw New InvalidArgumentException("MailKit invalid domain label")
+        For Each ch As String In String.Chars(label)
+            If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-", ch, True) Then Throw New InvalidArgumentException("MailKit invalid domain")
+        Next
+    Next
+End Sub
+
+Private Sub MailMediaType(value As String)
+    If String.Len(value) > 127 Then Throw New InvalidArgumentException("MailKit media type exceeds 127 characters")
+    Dim parts As Array Of String = String.Split(value, "/", True)
+    If Array.Count(parts) <> 2 Then Throw New InvalidArgumentException("MailKit media type requires type/subtype")
+    For Each part As String In parts
+        If String.Len(part) = 0 Then Throw New InvalidArgumentException("MailKit empty media token")
+        For Each ch As String In String.Chars(part)
+            If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&^_.+-", ch, True) Then Throw New InvalidArgumentException("MailKit invalid media token")
+        Next
+    Next
+End Sub
+
+Private Sub MailFilename(value As String)
+    If String.Len(value) < 1 Or String.Len(value) > 200 Then Throw New InvalidArgumentException("MailKit attachment filename must be 1..200 ASCII characters")
+    For Each ch As String In String.Chars(value)
+        If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._-", ch, True) Then Throw New InvalidArgumentException("MailKit attachment filename contains unsupported characters")
+    Next
+    If value = "." Or value = ".." Then Throw New InvalidArgumentException("MailKit invalid attachment filename")
+End Sub
+
+Private Function MailDateHeader() As String
+    Dim now As DateTime = DateTime.Now(TimeZone.Utc)
+    Dim days As Array Of String = String.Split("Sun Mon Tue Wed Thu Fri Sat", " ", True)
+    Dim months As Array Of String = String.Split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", " ", True)
+    Return days(now.DayOfWeek - 1) + ", " + Str(now.Day) + " " + months(now.Month - 1) + " " + Str(now.Year) + " " + String.Right("0" + Str(now.Hour), 2) + ":" + String.Right("0" + Str(now.Minute), 2) + ":" + String.Right("0" + Str(now.Second), 2) + " +0000"
+End Function
+
+Private Function MailEncodeBody(data As Bytes) As String
+    Dim encoded As Bytes = Bytes.FromString(data.ToBase64(), Text.Encodings.ASCII)
+    Dim output As New Bytes()
+    Dim column As Integer = 0
+    For offset As Integer = 0 To encoded.Count - 1
+        output.Append(encoded.Item(offset))
+        column += 1
+        If column = 76 Then
+            output.Append(13)
+            output.Append(10)
+            column = 0
+        End If
+    Next
+    If column > 0 Then
+        output.Append(13)
+        output.Append(10)
+    End If
+    Return output.ToString(Text.Encodings.ASCII)
+End Function
+
+Private Function MailEncodeSubject(value As String) As String
+    MailHeaderValue(value)
+    If Bytes.FromString(value, Text.Encodings.UTF8).Count > 4096 Then Throw New InvalidArgumentException("MailKit subject exceeds 4096 bytes")
+    Dim output As String = ""
+    Dim part As String = ""
+    For Each ch As String In String.Chars(value)
+        If Bytes.FromString(part + ch, Text.Encodings.UTF8).Count > 42 Then
+            If String.Len(output) > 0 Then output += MailCRLF + " "
+            output += "=?UTF-8?B?" + Bytes.FromString(part, Text.Encodings.UTF8).ToBase64() + "?="
+            part = ""
+        End If
+        part += ch
+    Next
+    If String.Len(part) > 0 Then
+        If String.Len(output) > 0 Then output += MailCRLF + " "
+        output += "=?UTF-8?B?" + Bytes.FromString(part, Text.Encodings.UTF8).ToBase64() + "?="
+    End If
+    Return output
+End Function
+
+Private Function MailUTF8Text(data As Bytes) As String
+    For i As Integer = 0 To data.Count - 1
+        If data.Item(i) = 0 Then Throw New InvalidArgumentException("MailKit text cannot contain NUL")
+    Next
+    Return data.ToString(Text.Encodings.UTF8)
+End Function
+
+Private Function MailDecodeBase64(value As String, maxBytes As Integer) As Bytes
+    Dim compact As String = String.Replace(value, "\r", "")
+    compact = String.Replace(compact, "\n", "")
+    compact = String.Replace(compact, " ", "")
+    compact = String.Replace(compact, "\t", "")
+    Dim decoded As Result Of Bytes, String = Bytes.FromBase64(compact)
+    If Not decoded.IsOk Then Throw New InvalidArgumentException("MailKit malformed base64")
+    If decoded.Value.Count > maxBytes Then Throw New InvalidArgumentException("MailKit decoded body exceeds budget")
+    ' Canonical comparison rejects permissive decoders and nonzero padding bits.
+    If String.Compare(decoded.Value.ToBase64(), compact, True) <> 0 Then Throw New InvalidArgumentException("MailKit noncanonical base64")
+    Return decoded.Value
+End Function
+
+''' An owned immutable attachment; Data returns a defensive copy.
+Public Class MailAttachment
+    Private Property mFilename As String
+    Private Property mMediaType As String
+    Private Property mData As Bytes
+
+    Public Sub Constructor(filename As String, mediaType As String, data As Bytes, maxBytes As Integer = 8388608)
+        MailLimit(maxBytes)
+        MailFilename(filename)
+        MailMediaType(mediaType)
+        If data Is Nil Then Throw New InvalidArgumentException("MailKit attachment data is Nil")
+        If data.Count > maxBytes Then Throw New InvalidArgumentException("MailKit attachment exceeds budget")
+        mFilename = filename
+        mMediaType = mediaType
+        mData = New Bytes(data.Count)
+        mData.Append(data)
+    End Sub
+
+    Public Property Filename As String
+        Get
+            Return mFilename
+        End Get
+    End Property
+    Public Property MediaType As String
+        Get
+            Return mMediaType
+        End Get
+    End Property
+    Public Property Size As Integer
+        Get
+            Return mData.Count
+        End Get
+    End Property
+    Public Property Data As Bytes
+        Get
+            Dim output As New Bytes(mData.Count)
+            output.Append(mData)
+            Return output
+        End Get
+    End Property
+End Class
+
+''' A bounded UTF-8 text/plain message with optional binary attachments.
+Public Class MailMessage
+    Public Property Sender As String = ""
+    Public Property Subject As String = ""
+    Private Property mTextBody As String = ""
+    Public Property TextBody As String
+        Get
+            Return mTextBody
+        End Get
+        Set
+            ' MIME text has canonical CRLF line endings, including before base64 encoding.
+            Dim normalized As String = String.Replace(value, "\r\n", "\n")
+            normalized = String.Replace(normalized, "\r", "\n")
+            mTextBody = String.Replace(normalized, "\n", MailCRLF)
+        End Set
+    End Property
+    Private Property mRecipients As Array Of String
+    Private Property mAttachments As Array Of MailAttachment
+
+    Public Sub AddRecipient(mailbox As String)
+        MailMailbox(mailbox)
+        If Array.Count(mRecipients) >= 100 Then Throw New InvalidArgumentException("MailKit supports at most 100 recipients")
+        Array.Append(mRecipients, mailbox)
+    End Sub
+
+    Public Sub AddAttachment(attachment As MailAttachment)
+        If attachment Is Nil Then Throw New InvalidArgumentException("MailKit attachment is Nil")
+        If Array.Count(mAttachments) >= 100 Then Throw New InvalidArgumentException("MailKit supports at most 100 attachments")
+        Array.Append(mAttachments, attachment)
+    End Sub
+
+    Public Property Recipients As Array Of String
+        Get
+            Return Array.Clone(mRecipients)
+        End Get
+    End Property
+    Public Property Attachments As Array Of MailAttachment
+        Get
+            Return Array.Clone(mAttachments)
+        End Get
+    End Property
+
+    Public Function Serialize(maxBytes As Integer = 16777216) As Bytes
+        MailLimit(maxBytes)
+        MailMailbox(Sender)
+        If Array.Count(mRecipients) = 0 Then Throw New InvalidArgumentException("MailKit requires a recipient")
+        Dim subjectHeader As String = MailEncodeSubject(Subject)
+        Dim textBytes As Bytes = Bytes.FromString(TextBody, Text.Encodings.UTF8)
+        Dim rawTotal As Integer = textBytes.Count
+        For Each attachment As MailAttachment In mAttachments
+            rawTotal += attachment.Size
+        Next
+        ' Base64 output requires at least four bytes for every three input bytes.
+        If rawTotal > maxBytes Or ((rawTotal + 2) \ 3) * 4 > maxBytes Then Throw New InvalidArgumentException("MailKit message exceeds budget")
+        Dim toHeader As String = ""
+        For Each recipient As String In mRecipients
+            MailMailbox(recipient)
+            If String.Len(toHeader) > 0 Then toHeader += "," + MailCRLF + " "
+            toHeader += recipient
+        Next
+        Dim output As Bytes = Bytes.FromString("Date: " + MailDateHeader() + MailCRLF + "From: " + Sender + MailCRLF + "To: " + toHeader + MailCRLF + "Subject: " + subjectHeader + MailCRLF + "MIME-Version: 1.0" + MailCRLF, Text.Encodings.ASCII)
+        If Array.Count(mAttachments) = 0 Then
+            output.Append(Bytes.FromString("Content-Type: text/plain; charset=UTF-8" + MailCRLF + "Content-Transfer-Encoding: base64" + MailCRLF + MailCRLF + MailEncodeBody(textBytes), Text.Encodings.ASCII))
+        Else
+            output.Append(Bytes.FromString("Content-Type: multipart/mixed; boundary=\"" + MailBoundary + "\"" + MailCRLF + MailCRLF, Text.Encodings.ASCII))
+            output.Append(Bytes.FromString("--" + MailBoundary + MailCRLF + "Content-Type: text/plain; charset=UTF-8" + MailCRLF + "Content-Transfer-Encoding: base64" + MailCRLF + MailCRLF + MailEncodeBody(textBytes), Text.Encodings.ASCII))
+            For Each attachment As MailAttachment In mAttachments
+                output.Append(Bytes.FromString("--" + MailBoundary + MailCRLF + "Content-Type: " + attachment.MediaType + MailCRLF + "Content-Disposition: attachment; filename=\"" + attachment.Filename + "\"" + MailCRLF + "Content-Transfer-Encoding: base64" + MailCRLF + MailCRLF + MailEncodeBody(attachment.Data), Text.Encodings.ASCII))
+                If output.Count > maxBytes Then Throw New InvalidArgumentException("MailKit message exceeds budget")
+            Next
+            output.Append(Bytes.FromString("--" + MailBoundary + "--" + MailCRLF, Text.Encodings.ASCII))
+        End If
+        If String.IndexOf(output.ToString(Text.Encodings.ASCII), MailCRLF + MailCRLF, True) > 32768 Then Throw New InvalidArgumentException("MailKit MIME header block exceeds budget")
+        If output.Count > maxBytes Then Throw New InvalidArgumentException("MailKit message exceeds budget")
+        Return output
+    End Function
+End Class
+
+Private Class MailMIMEPart
+    Public Property Names As Array Of String
+    Public Property Values As Array Of String
+    Public Property Body As String
+
+    Public Sub AddHeader(name As String, value As String)
+        If Array.Count(Names) >= 100 Then Throw New InvalidArgumentException("MailKit too many MIME headers")
+        For Each existing As String In Names
+            If String.Compare(existing, name, False) = 0 Then Throw New InvalidArgumentException("MailKit duplicate MIME header")
+        Next
+        Array.Append(Names, name)
+        Array.Append(Values, value)
+    End Sub
+
+    Public Function Header(name As String) As String
+        For i As Integer = 0 To Array.Count(Names) - 1
+            If String.Compare(Names(i), name, False) = 0 Then Return Values(i)
+        Next
+        Return ""
+    End Function
+End Class
+
+Private Function MailParsePart(wire As String) As MailMIMEPart
+    Dim divider As Integer = String.IndexOf(wire, MailCRLF + MailCRLF, True)
+    If divider < 0 Or divider > 32768 Then Throw New InvalidArgumentException("MailKit missing or oversized MIME headers")
+    Dim part As New MailMIMEPart()
+    part.Body = String.Substring(wire, divider + 4)
+    Dim name As String = ""
+    Dim value As String = ""
+    For Each line As String In String.Split(String.Left(wire, divider), MailCRLF, True)
+        If String.Len(line) > 998 Then Throw New InvalidArgumentException("MailKit MIME header line exceeds 998 octets")
+        If String.StartsWith(line, " ", True) Or String.StartsWith(line, "\t", True) Then
+            If String.Len(name) = 0 Then Throw New InvalidArgumentException("MailKit orphan MIME header continuation")
+            value += " " + String.Trim(line)
+        Else
+            If String.Len(name) > 0 Then part.AddHeader(name, value)
+            Dim colon As Integer = String.IndexOf(line, ":", True)
+            If colon < 1 Then Throw New InvalidArgumentException("MailKit invalid MIME header")
+            name = String.Left(line, colon)
+            For Each ch As String In String.Chars(name)
+                If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-", ch, True) Then Throw New InvalidArgumentException("MailKit invalid MIME header name")
+            Next
+            value = String.Trim(String.Substring(line, colon + 1))
+        End If
+        If String.Len(value) > 32768 Then Throw New InvalidArgumentException("MailKit unfolded MIME header exceeds budget")
+    Next
+    If String.Len(name) > 0 Then part.AddHeader(name, value)
+    Return part
+End Function
+
+Private Function MailParameter(value As String, parameter As String) As String
+    Dim output As String = ""
+    Dim found As Boolean = False
+    Dim fields As Array Of String = String.Split(value, ";", True)
+    For i As Integer = 1 To Array.Count(fields) - 1
+        Dim item As String = String.Trim(fields(i))
+        Dim equalsAt As Integer = String.IndexOf(item, "=", True)
+        If equalsAt < 1 Then Throw New InvalidArgumentException("MailKit invalid MIME parameter")
+        If String.Compare(String.Trim(String.Left(item, equalsAt)), parameter, False) = 0 Then
+            If found Then Throw New InvalidArgumentException("MailKit duplicate MIME parameter")
+            found = True
+            output = String.Trim(String.Substring(item, equalsAt + 1))
+            If String.StartsWith(output, "\"", True) Then
+                If String.Len(output) < 2 Or Not String.EndsWith(output, "\"", True) Then Throw New InvalidArgumentException("MailKit invalid MIME quoted parameter")
+                output = String.Substring(output, 1, String.Len(output) - 2)
+                If String.Contains(output, "\"", True) Or String.Contains(output, "\\", True) Then Throw New InvalidArgumentException("MailKit escaped MIME parameters unsupported")
+            Else
+                ' Unquoted MIME parameter values must be RFC 2045 tokens.
+                If String.Len(output) = 0 Then Throw New InvalidArgumentException("MailKit empty MIME parameter")
+                For Each ch As String In String.Chars(output)
+                    Dim cp As Integer = String.Asc(ch)
+                    If cp <= 32 Or cp >= 127 Or String.Contains("()<>@,;:\"/[]?=\\", ch, True) Then Throw New InvalidArgumentException("MailKit invalid unquoted MIME parameter")
+                Next
+            End If
+        End If
+    Next
+    Return output
+End Function
+
+Private Function MailBaseMediaType(value As String) As String
+    Dim semicolon As Integer = String.IndexOf(value, ";", True)
+    If semicolon < 0 Then Return String.LCase(String.Trim(value))
+    Return String.LCase(String.Trim(String.Left(value, semicolon)))
+End Function
+
+Private Function MailPartData(part As MailMIMEPart, maxBytes As Integer) As Bytes
+    If String.Compare(part.Header("Content-Transfer-Encoding"), "base64", False) <> 0 Then Throw New InvalidArgumentException("MailKit parser supports base64 parts only")
+    Return MailDecodeBase64(part.Body, maxBytes)
+End Function
+
+Private Function MailDecodeSubject(value As String) As String
+    If Not String.StartsWith(value, "=?", True) Then
+        MailHeaderValue(value)
+        If String.Len(value) > 4096 Then Throw New InvalidArgumentException("MailKit subject exceeds budget")
+        Return value
+    End If
+    Dim output As String = ""
+    ' RFC 2047 adjacent encoded words may be separated by horizontal tabs.
+    Dim words As String = String.Replace(value, "\t", " ")
+    For Each token As String In String.Split(words, " ", True)
+        If String.Len(token) > 0 Then
+            If String.Len(token) > 75 Or String.Len(token) < 12 Then Throw New InvalidArgumentException("MailKit invalid encoded subject word")
+            If Not String.StartsWith(token, "=?UTF-8?B?", False) Or Not String.EndsWith(token, "?=", True) Then Throw New InvalidArgumentException("MailKit supports UTF-8 base64 encoded subject words only")
+            output += MailUTF8Text(MailDecodeBase64(String.Substring(token, 10, String.Len(token) - 12), 4096))
+        End If
+    Next
+    MailHeaderValue(output)
+    If Bytes.FromString(output, Text.Encodings.UTF8).Count > 4096 Then Throw New InvalidArgumentException("MailKit decoded subject exceeds budget")
+    Return output
+End Function
+
+''' Parse the documented ASCII-wire, UTF8/base64 flat MIME subset; no files are written.
+Public Function ParseMailMessage(data As Bytes, maxBytes As Integer = 16777216) As MailMessage
+    MailLimit(maxBytes)
+    If data Is Nil Then Throw New InvalidArgumentException("MailKit MIME data is Nil")
+    If data.Count > maxBytes Then Throw New InvalidArgumentException("MailKit MIME input exceeds budget")
+    For i As Integer = 0 To data.Count - 1
+        Dim b As Integer = data.Item(i)
+        If b = 0 Or b > 127 Or (b < 32 And b <> 9 And b <> 10 And b <> 13) Or b = 127 Then Throw New InvalidArgumentException("MailKit MIME wire must be ASCII without controls")
+    Next
+    Dim wire As String = data.ToString(Text.Encodings.ASCII)
+    For Each line As String In String.Split(wire, MailCRLF, True)
+        If String.Contains(line, "\r", True) Or String.Contains(line, "\n", True) Then Throw New InvalidArgumentException("MailKit MIME requires CRLF line endings")
+    Next
+    Dim root As MailMIMEPart = MailParsePart(wire)
+    If root.Header("MIME-Version") <> "1.0" Then Throw New InvalidArgumentException("MailKit parser requires MIME-Version 1.0")
+    Dim message As New MailMessage()
+    message.Sender = root.Header("From")
+    MailMailbox(message.Sender)
+    For Each recipient As String In String.Split(root.Header("To"), ",", True)
+        message.AddRecipient(String.Trim(recipient))
+    Next
+    message.Subject = MailDecodeSubject(root.Header("Subject"))
+    Dim mediaType As String = MailBaseMediaType(root.Header("Content-Type"))
+    If mediaType = "text/plain" Then
+        If String.Compare(MailParameter(root.Header("Content-Type"), "charset"), "UTF-8", False) <> 0 Then Throw New InvalidArgumentException("MailKit text charset must be UTF-8")
+        message.TextBody = MailUTF8Text(MailPartData(root, maxBytes))
+    ElseIf mediaType = "multipart/mixed" Then
+        If String.Len(root.Header("Content-Transfer-Encoding")) > 0 And String.Compare(root.Header("Content-Transfer-Encoding"), "7bit", False) <> 0 Then Throw New InvalidArgumentException("MailKit encoded multipart container unsupported")
+        Dim boundary As String = MailParameter(root.Header("Content-Type"), "boundary")
+        If String.Len(boundary) < 1 Or String.Len(boundary) > 70 Then Throw New InvalidArgumentException("MailKit invalid MIME boundary")
+        For Each ch As String In String.Chars(boundary)
+            If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'()+_,-./:=?", ch, True) Then Throw New InvalidArgumentException("MailKit unsupported MIME boundary")
+        Next
+        Dim marker As String = "--" + boundary
+        Dim opened As Boolean = False
+        Dim closed As Boolean = False
+        Dim partLines As Array Of String
+        Dim partCount As Integer = 0
+        Dim decodedTotal As Integer = 0
+        For Each line As String In String.Split(root.Body, MailCRLF, True)
+            If String.Compare(line, marker, True) = 0 Or String.Compare(line, marker + "--", True) = 0 Then
+                If closed Then Throw New InvalidArgumentException("MailKit extra MIME delimiter")
+                Dim partText As String = String.Join(partLines, MailCRLF) + MailCRLF
+                If opened Then
+                    Dim part As MailMIMEPart = MailParsePart(partText)
+                    Dim content As Bytes = MailPartData(part, maxBytes - decodedTotal)
+                    decodedTotal += content.Count
+                    If partCount = 0 Then
+                        If MailBaseMediaType(part.Header("Content-Type")) <> "text/plain" Or String.Compare(MailParameter(part.Header("Content-Type"), "charset"), "UTF-8", False) <> 0 Then Throw New InvalidArgumentException("MailKit first MIME part must be UTF8 text/plain")
+                        message.TextBody = MailUTF8Text(content)
+                    Else
+                        If MailBaseMediaType(part.Header("Content-Disposition")) <> "attachment" Then Throw New InvalidArgumentException("MailKit subsequent MIME parts must be attachments")
+                        message.AddAttachment(New MailAttachment(MailParameter(part.Header("Content-Disposition"), "filename"), part.Header("Content-Type"), content, maxBytes))
+                    End If
+                    partCount += 1
+                    If partCount > 101 Then Throw New InvalidArgumentException("MailKit too many MIME parts")
+                ElseIf String.Len(String.Trim(partText)) > 0 Then
+                    Throw New InvalidArgumentException("MailKit MIME preamble unsupported")
+                End If
+                Array.Clear(partLines)
+                opened = True
+                closed = String.Compare(line, marker + "--", True) = 0
+            ElseIf closed Then
+                If String.Len(line) > 0 Then Throw New InvalidArgumentException("MailKit MIME epilogue unsupported")
+            Else
+                Array.Append(partLines, line)
+            End If
+        Next
+        If Not closed Or partCount = 0 Then Throw New InvalidArgumentException("MailKit unclosed or empty MIME multipart")
+    Else
+        Throw New InvalidArgumentException("MailKit supports text/plain or multipart/mixed only")
+    End If
+    Return message
+End Function
+
+''' SMTP response errors retain the numeric server code without exposing credentials.
+Public Class SMTPException Inherits Exception
+    Public Sub Constructor(message As String, responseCode As Integer = 0)
+        Super.Constructor(message, responseCode)
+    End Sub
+End Class
+
+''' Explicit SMTP transport configuration. TLS is required unless AllowInsecure is opted into.
+Public Class SMTPOptions
+    Public Property IPv4Address As String = "127.0.0.1"
+    Public Property Port As Integer = 465
+    Public Property ImplicitTLS As Boolean = True
+    Public Property AllowInsecure As Boolean = False
+    Public Property ServerName As String = ""
+    Public Property TrustedCaPath As String = ""
+    Public Property EHLOName As String = "localhost"
+    Public Property TimeoutMs As Integer = 10000
+    Public Property MaxMessageBytes As Integer = 16777216
+    Public Property Username As String = ""
+    Public Property Password As String = ""
+End Class
+
+Private Class MailSMTPReply
+    Public Property Code As Integer
+    Public Property Text As String
+End Class
+
+Private Class MailSMTPConnection
+    Public Property Socket As TCPSocket
+    Public Property Pending As String = ""
+    Public Property TimeoutMs As Integer
+
+    Private Function ReadLine(started As Integer) As String
+        While True
+            Dim newline As Integer = String.IndexOf(Pending, MailCRLF, True)
+            If newline >= 0 Then
+                If newline > 510 Then Throw New SMTPException("MailKit SMTP reply line exceeds 512 octets")
+                Dim line As String = String.Left(Pending, newline)
+                If String.Contains(line, "\r", True) Or String.Contains(line, "\n", True) Then Throw New SMTPException("MailKit SMTP reply contains a bare newline")
+                Pending = String.Substring(Pending, newline + 2)
+                Return line
+            End If
+            If String.Len(Pending) > 511 Then Throw New SMTPException("MailKit SMTP reply line exceeds 512 octets")
+            If String.Len(Pending) = 511 And Not String.EndsWith(Pending, "\r", True) Then Throw New SMTPException("MailKit SMTP reply line exceeds 512 octets")
+            If System.Microseconds() - started >= TimeoutMs * 1000 Then Throw New SMTPException("MailKit SMTP response deadline expired")
+            If Socket.BytesAvailable > 0 Then
+                Dim chunk As Bytes = Socket.Read(512)
+                For i As Integer = 0 To chunk.Count - 1
+                    Dim b As Integer = chunk.Item(i)
+                    If b > 126 Or (b < 32 And b <> 9 And b <> 10 And b <> 13) Then Throw New SMTPException("MailKit SMTP reply contains invalid ASCII")
+                Next
+                Pending += chunk.ToString(Text.Encodings.ASCII)
+            Else
+                If Not Socket.IsConnected Then Throw New SMTPException("MailKit SMTP peer closed before its response")
+                Sleep(1)
+            End If
+        End While
+        Return ""
+    End Function
+
+    Public Function ReadReply() As MailSMTPReply
+        Dim reply As New MailSMTPReply()
+        Dim started As Integer = System.Microseconds()
+        For lineNumber As Integer = 0 To 63
+            Dim line As String = Me.ReadLine(started)
+            If String.Len(line) < 3 Then Throw New SMTPException("MailKit malformed SMTP reply")
+            Dim code As Integer = 0
+            For i As Integer = 0 To 2
+                Dim ch As String = String.Substring(line, i, 1)
+                If Not String.Contains("0123456789", ch, True) Then Throw New SMTPException("MailKit malformed SMTP reply code")
+                code = code * 10 + String.Asc(ch) - 48
+            Next
+            If code < 200 Or code > 599 Then Throw New SMTPException("MailKit invalid SMTP reply code")
+            If lineNumber = 0 Then reply.Code = code
+            If reply.Code <> code Then Throw New SMTPException("MailKit inconsistent multiline SMTP reply code")
+            If String.Len(line) = 3 Then
+                reply.Text += line + MailCRLF
+                Return reply
+            End If
+            Dim separator As String = String.Substring(line, 3, 1)
+            If separator <> " " And separator <> "-" Then Throw New SMTPException("MailKit malformed SMTP reply separator")
+            reply.Text += line + MailCRLF
+            If separator = " " Then Return reply
+        Next
+        Throw New SMTPException("MailKit SMTP reply exceeds 64 lines")
+    End Function
+
+    Public Function Expect(expected As Integer) As MailSMTPReply
+        Dim reply As MailSMTPReply = Me.ReadReply()
+        If reply.Code <> expected Then Throw New SMTPException("MailKit SMTP server rejected protocol step; code " + Str(reply.Code), reply.Code)
+        Return reply
+    End Function
+
+    Public Sub Command(value As String)
+        If Bytes.FromString(value, Text.Encodings.UTF8).Count > 510 Then Throw New InvalidArgumentException("MailKit SMTP command exceeds 512 octets")
+        Socket.Write(value + MailCRLF)
+    End Sub
+End Class
+
+''' Validate CRLF SMTP data, dot-stuff it and append the terminating period line.
+Public Function SMTPDataBlock(wire As Bytes, maxBytes As Integer = 16777216) As Bytes
+    MailLimit(maxBytes)
+    If wire Is Nil Then Throw New InvalidArgumentException("MailKit SMTP data is Nil")
+    If wire.Count > maxBytes Then Throw New InvalidArgumentException("MailKit SMTP data exceeds budget")
+    Dim output As New Bytes(wire.Count + 5)
+    Dim atStart As Boolean = True
+    Dim lineLength As Integer = 0
+    For i As Integer = 0 To wire.Count - 1
+        Dim b As Integer = wire.Item(i)
+        If b = 13 Then
+            If i + 1 >= wire.Count Then Throw New InvalidArgumentException("MailKit SMTP data contains bare CR")
+            If wire.Item(i + 1) <> 10 Then Throw New InvalidArgumentException("MailKit SMTP data contains bare CR")
+        ElseIf b = 10 Then
+            If i = 0 Then Throw New InvalidArgumentException("MailKit SMTP data contains bare LF")
+            If wire.Item(i - 1) <> 13 Then Throw New InvalidArgumentException("MailKit SMTP data contains bare LF")
+        ElseIf b = 0 Or b > 127 Then
+            Throw New InvalidArgumentException("MailKit SMTP DATA requires ASCII MIME encoding")
+        End If
+        If atStart And b = 46 Then output.Append(46)
+        output.Append(b)
+        If b = 10 Then
+            atStart = True
+            lineLength = 0
+        Else
+            atStart = False
+            If b <> 13 Then lineLength += 1
+            If lineLength > 998 Then Throw New InvalidArgumentException("MailKit SMTP data line exceeds 998 octets")
+        End If
+    Next
+    If Not atStart Then output.Append(Bytes.FromString(MailCRLF, Text.Encodings.ASCII))
+    output.Append(Bytes.FromString("." + MailCRLF, Text.Encodings.ASCII))
+    Return output
+End Function
+
+''' Submit one message. Returns the final DATA acceptance reply; failures after DATA can be ambiguous.
+Public Function SubmitMail(message As MailMessage, options As SMTPOptions) As String
+    If message Is Nil Or options Is Nil Then Throw New InvalidArgumentException("MailKit message/options must not be Nil")
+    MailLimit(options.MaxMessageBytes)
+    If options.Port < 1 Or options.Port > 65535 Then Throw New InvalidArgumentException("MailKit invalid SMTP port")
+    If options.TimeoutMs < 1 Or options.TimeoutMs > 300000 Then Throw New InvalidArgumentException("MailKit SMTP timeout must be 1..300000 ms")
+    If Not options.ImplicitTLS And Not options.AllowInsecure Then Throw New InvalidArgumentException("MailKit plaintext SMTP requires explicit AllowInsecure")
+    If options.ImplicitTLS And String.Len(options.ServerName) = 0 Then Throw New InvalidArgumentException("MailKit TLS requires ServerName for certificate verification")
+    If String.Len(options.EHLOName) < 1 Or String.Len(options.EHLOName) > 253 Then Throw New InvalidArgumentException("MailKit invalid EHLO name")
+    For Each ch As String In String.Chars(options.EHLOName)
+        If Not String.Contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-", ch, True) Then Throw New InvalidArgumentException("MailKit invalid EHLO name")
+    Next
+    If String.Len(options.Username) > 0 Or String.Len(options.Password) > 0 Then
+        If Not options.ImplicitTLS Then Throw New InvalidArgumentException("MailKit AUTH requires TLS")
+        MailHeaderValue(options.Username)
+        MailHeaderValue(options.Password)
+        If Bytes.FromString(options.Username, Text.Encodings.UTF8).Count > 120 Or Bytes.FromString(options.Password, Text.Encodings.UTF8).Count > 120 Then Throw New InvalidArgumentException("MailKit AUTH credentials exceed budget")
+    End If
+    Dim wire As Bytes = SMTPDataBlock(message.Serialize(options.MaxMessageBytes), options.MaxMessageBytes)
+    Dim session As New MailSMTPConnection()
+    session.Socket = New TCPSocket()
+    session.TimeoutMs = options.TimeoutMs
+    session.Socket.Timeout = options.TimeoutMs
+    session.Socket.Secure = options.ImplicitTLS
+    session.Socket.ServerName = options.ServerName
+    session.Socket.TrustedCaPath = options.TrustedCaPath
+    Try
+        session.Socket.Connect(options.IPv4Address, options.Port)
+        session.Expect(220)
+        session.Command("EHLO " + options.EHLOName)
+        Dim hello As MailSMTPReply = session.Expect(250)
+        If String.Len(options.Username) > 0 Or String.Len(options.Password) > 0 Then
+            Dim plain As Boolean = False
+            Dim replyLines As Array Of String = String.Split(hello.Text, MailCRLF, True)
+            For i As Integer = 1 To Array.Count(replyLines) - 1
+                Dim line As String = replyLines(i)
+                If String.Len(line) >= 9 Then
+                    Dim capability As String = String.Substring(line, 4)
+                    If String.StartsWith(capability, "AUTH ", False) Or String.StartsWith(capability, "AUTH=", False) Then
+                        For Each mechanism As String In String.Split(String.Substring(capability, 5), " ", True)
+                            If String.Compare(mechanism, "PLAIN", False) = 0 Then plain = True
+                        Next
+                    End If
+                End If
+            Next
+            If Not plain Then Throw New SMTPException("MailKit SMTP server did not advertise AUTH PLAIN")
+            Dim credentials As New Bytes()
+            credentials.Append(0)
+            credentials.Append(Bytes.FromString(options.Username, Text.Encodings.UTF8))
+            credentials.Append(0)
+            credentials.Append(Bytes.FromString(options.Password, Text.Encodings.UTF8))
+            session.Command("AUTH PLAIN " + credentials.ToBase64())
+            session.Expect(235)
+        End If
+        session.Command("MAIL FROM:<" + message.Sender + ">")
+        session.Expect(250)
+        For Each recipient As String In message.Recipients
+            session.Command("RCPT TO:<" + recipient + ">")
+            Dim recipientReply As MailSMTPReply = session.ReadReply()
+            If recipientReply.Code <> 250 And recipientReply.Code <> 251 Then Throw New SMTPException("MailKit SMTP recipient rejected; code " + Str(recipientReply.Code), recipientReply.Code)
+        Next
+        session.Command("DATA")
+        session.Expect(354)
+        session.Socket.Write(wire)
+        Dim accepted As MailSMTPReply = session.Expect(250)
+        ' Acceptance is final even if the peer disconnects during QUIT.
+        Try
+            session.Command("QUIT")
+        Catch e As Exception
+        End Try
+        Return accepted.Text
+    Finally
+        Try
+            session.Socket.Close()
+        Catch cleanup As Exception
+            ' Preserve the protocol outcome, especially an already accepted DATA reply.
+        End Try
+    End Try
+End Function

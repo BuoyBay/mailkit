@@ -1,0 +1,15 @@
+Import mailkit
+
+Sub Main()
+    Dim message As New MailMessage()
+    message.Sender = "sender@example.test"
+    message.AddRecipient("reader@example.test")
+    message.Subject = "Hello 世界"
+    message.TextBody = "A UTF-8 message with a binary attachment."
+    message.AddAttachment(New MailAttachment("hello.txt", "text/plain", Bytes.FromString("Hello!", Text.Encodings.UTF8)))
+    Dim wire As Bytes = message.Serialize()
+    Dim parsed As MailMessage = ParseMailMessage(wire)
+    Print parsed.Subject
+    Print "MIME bytes: " + Str(wire.Count)
+    ' Serialization and parsing never connect or send. SubmitMail requires an explicit call.
+End Sub

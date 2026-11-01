@@ -1,0 +1,1 @@
+{"schema":1,"name":"mailkit","version":"0.1.0","description":"Bounded UTF8/base64 MIME messages and explicit SMTP submission over verified implicit TLS or opt-in plaintext relays"}
