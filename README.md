@@ -1,4 +1,4 @@
-# MIME messages over SMTP
+# MIME over SMTP
 
 `Import mailkit` adds owned MIME messages and explicit SMTP submission. It has no
 package dependencies or native bridge of its own. Copy
