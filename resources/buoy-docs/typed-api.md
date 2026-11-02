@@ -99,8 +99,6 @@ Returns: no value.
 | --- |
 | `Bytes` |
 
-## MailKit functions
-
 ### ParseMailMessage
 
 `Public Function ParseMailMessage(data As Bytes, maxBytes As Integer = 16777216) As MailMessage`

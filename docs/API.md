@@ -108,39 +108,18 @@ also buffers incoming bytes in its background reader before the package drains
 and validates them, so response limits are parser limits, not a hard socket-memory
 cap. See Buoy's `tcpsocket.md` and `streamsocket.md` contracts.
 
-## Budgets and verification
+## Budgets and native prerequisites
 
-Limits must be 1–33554432 bytes. Message serialization checks total raw bytes
-before base64 work and final MIME bytes before returning. Parsing checks input
-size before decoding and bounds total decoded data. Header blocks are limited to
-32768 bytes and 100 fields each. This is whole-message, in-memory processing with
-several bounded copies, not streaming or a hard peak-memory allocator. Attachment
-constructor limits apply to each copied attachment; retain only as much builder
-data as your application permits. SMTPDataBlock's budget applies to input; output
-can add one dot per line, a missing final CRLF and the three-byte terminator.
+Limits must be 1–33554432 bytes. Serialization checks raw bytes before base64
+work and final MIME size before returning. Parsing checks input size before
+decoding and bounds total decoded data. Header blocks are capped at 32768 bytes
+and 100 fields. This is whole-message processing with bounded copies, not a
+streaming or hard peak-memory allocator.
 
-Run:
+Attachment limits apply to each copied attachment. SMTPDataBlock can expand its
+input through dot-stuffing, a missing final CRLF and the three-byte terminator.
 
-```sh
-/usr/bin/buoy pkg seal . -o packages/mailkit-0.1.0.buipkg
-```
-
-The verifier seals current source into an isolated consumer, inspects compiler
-JSON for module/tests/example across all six desktop targets, runs Linux sealed
-consumers, and checks generated MIME with Python's independent email parser.
-It covers Unicode/folded subject and text, empty and all-byte attachments,
-defensive ownership, header injection, strict MIME failures, limits and dot
-stuffing. Local SMTP fixtures cover split/multiline replies, successful acceptance,
-recipient rejection, invalid multiline codes and a silent-server deadline. A
-fresh local CA certificate exercises genuine implicit TLS plus AUTH PLAIN, and
-separate cases reject untrusted and hostname-mismatched certificates. Nothing is
-sent to an external mail server. Native execution is verified on Linux x86_64;
-macOS, Windows and ARM64 targets are compiler checks only.
-
-On this Linux Buoy 0.72 installation, SMTP consumers need the established
-BUI-301 TLS-link workaround:
-explicit installed TLS/SSL/Crypto archives and host library stubs. The verifier
-supplies these flags. `BUOY` and `BPM_PACKAGER` select compiler/packager; Python 3,
-OpenSSL command-line tools and the installed Buoy TLS archives are prerequisites.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.
+On affected Linux Buoy 0.72 installations, SMTP consumers must explicitly link
+the installed TLS/SSL/Crypto archives and matching runtime stubs. Provision those
+toolchain components for the deployment host; they are separate from MailKit's
+source-only MIME and SMTP protocol code.
